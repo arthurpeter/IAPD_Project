@@ -2,7 +2,9 @@
 import os
 import random
 import re
+import shutil
 import time
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -38,6 +40,7 @@ CAPITALS_FILE = DATA_DIR / "capitals.csv"
 DATASET_FILE = DATA_DIR / (
     "weather_test.csv" if TEST_MODE else "weather_raw.csv"
 )
+DATASET_ARCHIVE = DATASET_FILE.with_suffix(".zip")
 
 DATA_SOURCES = {
     "countries": "https://countriesnow.space/api/v0.1/countries/capital",
@@ -185,6 +188,98 @@ RATE_LIMIT_STATE = {
 }
 
 
+# -------------------------------------------------------------------
+# CSV / ZIP CACHE
+# -------------------------------------------------------------------
+
+def restore_dataset_from_archive():
+    """
+    Restore the dataset from its ZIP archive only if the CSV is missing.
+
+    The archive must contain the CSV under its expected filename.
+    The original ZIP is never deleted by this function.
+    """
+    if TEST_MODE:
+        return
+
+    if DATASET_FILE.exists():
+        print(f"Using existing CSV cache: {DATASET_FILE}")
+        return
+
+    if not DATASET_ARCHIVE.exists():
+        print("No existing CSV or ZIP cache found.")
+        return
+
+    print(f"Restoring CSV from archive: {DATASET_ARCHIVE}")
+
+    temp_file = DATASET_FILE.with_suffix(".restore.tmp")
+
+    try:
+        with zipfile.ZipFile(DATASET_ARCHIVE, "r") as archive:
+            with archive.open(DATASET_FILE.name, "r") as source:
+                with open(temp_file, "wb") as destination:
+                    shutil.copyfileobj(source, destination)
+
+        # Only publish the restored CSV after extraction succeeds.
+        os.replace(temp_file, DATASET_FILE)
+
+        print(f"Successfully restored CSV: {DATASET_FILE}")
+
+    except (
+        OSError,
+        KeyError,
+        zipfile.BadZipFile,
+        RuntimeError,
+    ) as exc:
+        temp_file.unlink(missing_ok=True)
+
+        raise RuntimeError(
+            f"Failed to restore {DATASET_FILE} from "
+            f"{DATASET_ARCHIVE}: {exc}"
+        ) from exc
+
+
+def archive_dataset():
+    """
+    Create or replace the ZIP cache without deleting the CSV.
+
+    A temporary ZIP is created first. The previous archive is replaced
+    only after the new archive has been written successfully.
+    """
+    if TEST_MODE:
+        return
+
+    if not DATASET_FILE.exists():
+        print("No CSV available to archive.")
+        return
+
+    temp_archive = DATASET_ARCHIVE.with_suffix(".zip.tmp")
+
+    try:
+        with zipfile.ZipFile(
+            temp_archive,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as archive:
+            archive.write(
+                DATASET_FILE,
+                arcname=DATASET_FILE.name,
+            )
+
+        os.replace(temp_archive, DATASET_ARCHIVE)
+
+        print(f"CSV preserved: {DATASET_FILE}")
+        print(f"ZIP cache updated: {DATASET_ARCHIVE}")
+
+    except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+        temp_archive.unlink(missing_ok=True)
+        print(f"WARNING: Failed to update ZIP cache: {exc}")
+
+
+# -------------------------------------------------------------------
+# API REQUESTS AND RATE LIMITING
+# -------------------------------------------------------------------
+
 def get_json(url, params=None, headers=None):
     api_name = next(
         (
@@ -301,6 +396,10 @@ def get_json(url, params=None, headers=None):
     raise RuntimeError(f"{api_name}: request failed after retries")
 
 
+# -------------------------------------------------------------------
+# CAPITALS AND GEOCODING
+# -------------------------------------------------------------------
+
 def load_capitals():
     if CAPITALS_FILE.exists():
         capitals = pd.read_csv(CAPITALS_FILE)
@@ -403,6 +502,10 @@ def fill_coordinates(capitals):
     return capitals
 
 
+# -------------------------------------------------------------------
+# OPEN-METEO
+# -------------------------------------------------------------------
+
 def fetch_openmeteo(location, start_date, end_date):
     params = {
         "latitude": location.latitude,
@@ -469,6 +572,10 @@ def fetch_openmeteo(location, start_date, end_date):
 
     return frame
 
+
+# -------------------------------------------------------------------
+# NASA POWER
+# -------------------------------------------------------------------
 
 def nasa_request(location, start_date, end_date, group, parameters):
     remaining = list(parameters)
@@ -570,6 +677,10 @@ def fetch_nasa_group(location, start_date, end_date, group, parameters):
     return frame
 
 
+# -------------------------------------------------------------------
+# METEOSTAT
+# -------------------------------------------------------------------
+
 def fetch_meteostat(location, start_date, end_date):
     if not METEOSTAT_API_KEY:
         return None
@@ -609,6 +720,10 @@ def fetch_meteostat(location, start_date, end_date):
 
     return frame
 
+
+# -------------------------------------------------------------------
+# LOCATION DATA COLLECTION
+# -------------------------------------------------------------------
 
 def fetch_location(location, start_date, end_date):
     dates = pd.date_range(start_date, end_date, freq="D")
@@ -690,6 +805,10 @@ def fetch_location(location, start_date, end_date):
     return result, failed_sources
 
 
+# -------------------------------------------------------------------
+# DATASET COMPLETENESS CHECKS
+# -------------------------------------------------------------------
+
 def is_location_complete(dataset, code, start_date, end_date):
     if dataset is None or dataset.empty:
         return False
@@ -749,6 +868,10 @@ def is_location_complete(dataset, code, start_date, end_date):
 
     return True
 
+
+# -------------------------------------------------------------------
+# DATASET CONSOLIDATION
+# -------------------------------------------------------------------
 
 def consolidate_dataset():
     if not DATASET_FILE.exists():
@@ -815,6 +938,10 @@ def consolidate_dataset():
     df.to_csv(DATASET_FILE, index=False)
 
 
+# -------------------------------------------------------------------
+# MAIN
+# -------------------------------------------------------------------
+
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -825,7 +952,6 @@ def main():
         DATASET_FILE.unlink(missing_ok=True)
 
     capitals = load_capitals()
-
     capitals = fill_coordinates(capitals)
 
     if TEST_MODE:
@@ -925,4 +1051,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        # Restore the production cache before main() reads the CSV.
+        restore_dataset_from_archive()
+        main()
+
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+
+    finally:
+        archive_dataset()
