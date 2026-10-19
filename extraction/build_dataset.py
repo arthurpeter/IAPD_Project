@@ -1,4 +1,3 @@
-
 import os
 import random
 import re
@@ -11,6 +10,45 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+import subprocess
+import time
+
+USE_WINDSCRIBE_ROTATION = True
+CLI_PATH = r"C:\Program Files\Windscribe\windscribe-cli.exe"
+
+def rotate_windscribe_ip():
+    print("\n[VPN] Catching 429 / Initiating IP rotation...")
+    try:
+        disconnect = subprocess.run(
+            [CLI_PATH, "disconnect"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if disconnect.returncode != 0:
+            print(f"[VPN ERR] Disconnect failed: {disconnect.stderr.strip()}")
+            return False
+
+        time.sleep(3)
+
+        connect = subprocess.run(
+            [CLI_PATH, "connect", "best"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if connect.returncode != 0:
+            print(f"[VPN ERR] Connect failed: {connect.stderr.strip()}")
+            return False
+
+        print("[VPN] Waiting 5 seconds for network to stabilize...")
+        time.sleep(5)
+        print("[VPN] Windscribe CLI reported a successful connection.\n")
+        return True
+
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"[VPN ERR] Could not rotate IP: {e}")
+        return False
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env")
@@ -187,11 +225,6 @@ RATE_LIMIT_STATE = {
     for name, base_wait in API_BACKOFF_BASE.items()
 }
 
-
-# -------------------------------------------------------------------
-# CSV / ZIP CACHE
-# -------------------------------------------------------------------
-
 def restore_dataset_from_archive():
     """
     Restore the dataset from its ZIP archive only if the CSV is missing.
@@ -275,11 +308,6 @@ def archive_dataset():
         temp_archive.unlink(missing_ok=True)
         print(f"WARNING: Failed to update ZIP cache: {exc}")
 
-
-# -------------------------------------------------------------------
-# API REQUESTS AND RATE LIMITING
-# -------------------------------------------------------------------
-
 def get_json(url, params=None, headers=None):
     api_name = next(
         (
@@ -294,6 +322,8 @@ def get_json(url, params=None, headers=None):
         raise ValueError(f"Unknown API endpoint: {url}")
 
     state = RATE_LIMIT_STATE[api_name]
+
+    rotated_ip = False
 
     for attempt in range(MAX_RETRIES + 1):
         remaining_cooldown = state["cooldown_until"] - time.monotonic()
@@ -315,6 +345,17 @@ def get_json(url, params=None, headers=None):
 
             if response.status_code == 429:
                 state["total_429"] += 1
+
+                if attempt == MAX_RETRIES:
+                    response.raise_for_status()
+
+                
+                if USE_WINDSCRIBE_ROTATION and attempt >= 1 and not rotated_ip:
+                    rotated_ip = True
+                    if rotate_windscribe_ip():
+                        continue
+
+                    print("[VPN] Rotation failed; falling back to normal 429 backoff.")
 
                 retry_after = response.headers.get("Retry-After")
 
@@ -394,11 +435,6 @@ def get_json(url, params=None, headers=None):
             time.sleep(wait)
 
     raise RuntimeError(f"{api_name}: request failed after retries")
-
-
-# -------------------------------------------------------------------
-# CAPITALS AND GEOCODING
-# -------------------------------------------------------------------
 
 def load_capitals():
     if CAPITALS_FILE.exists():
@@ -501,11 +537,6 @@ def fill_coordinates(capitals):
 
     return capitals
 
-
-# -------------------------------------------------------------------
-# OPEN-METEO
-# -------------------------------------------------------------------
-
 def fetch_openmeteo(location, start_date, end_date):
     params = {
         "latitude": location.latitude,
@@ -571,11 +602,6 @@ def fetch_openmeteo(location, start_date, end_date):
         frame = frame.merge(other, on="date", how="outer")
 
     return frame
-
-
-# -------------------------------------------------------------------
-# NASA POWER
-# -------------------------------------------------------------------
 
 def nasa_request(location, start_date, end_date, group, parameters):
     remaining = list(parameters)
@@ -676,11 +702,6 @@ def fetch_nasa_group(location, start_date, end_date, group, parameters):
 
     return frame
 
-
-# -------------------------------------------------------------------
-# METEOSTAT
-# -------------------------------------------------------------------
-
 def fetch_meteostat(location, start_date, end_date):
     if not METEOSTAT_API_KEY:
         return None
@@ -719,11 +740,6 @@ def fetch_meteostat(location, start_date, end_date):
     })
 
     return frame
-
-
-# -------------------------------------------------------------------
-# LOCATION DATA COLLECTION
-# -------------------------------------------------------------------
 
 def fetch_location(location, start_date, end_date):
     dates = pd.date_range(start_date, end_date, freq="D")
@@ -804,11 +820,6 @@ def fetch_location(location, start_date, end_date):
 
     return result, failed_sources
 
-
-# -------------------------------------------------------------------
-# DATASET COMPLETENESS CHECKS
-# -------------------------------------------------------------------
-
 def is_location_complete(dataset, code, start_date, end_date):
     if dataset is None or dataset.empty:
         return False
@@ -867,11 +878,6 @@ def is_location_complete(dataset, code, start_date, end_date):
             return False
 
     return True
-
-
-# -------------------------------------------------------------------
-# DATASET CONSOLIDATION
-# -------------------------------------------------------------------
 
 def consolidate_dataset():
     if not DATASET_FILE.exists():
@@ -936,11 +942,6 @@ def consolidate_dataset():
     ).reset_index(drop=True)
 
     df.to_csv(DATASET_FILE, index=False)
-
-
-# -------------------------------------------------------------------
-# MAIN
-# -------------------------------------------------------------------
 
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1052,7 +1053,6 @@ def main():
 
 if __name__ == "__main__":
     try:
-        # Restore the production cache before main() reads the CSV.
         restore_dataset_from_archive()
         main()
 
